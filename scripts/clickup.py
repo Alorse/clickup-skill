@@ -137,9 +137,8 @@ def cmd_task(args):
         payload = {"name": args.name}
         if args.description:
             payload["description"] = args.description
-        if args.description_file:
-            with open(args.description_file) as f:
-                payload["markdown_content"] = f.read()
+        if args.markdown:
+            payload["markdown_content"] = args.markdown
         if args.assignees:
             payload["assignees"] = [int(x) for x in args.assignees.split(",")]
         if args.priority is not None:
@@ -159,13 +158,10 @@ def cmd_task(args):
         payload = {}
         if args.name:
             payload["name"] = args.name
-        if args.markdown_description:
-            payload["markdown_content"] = args.markdown_description
+        if args.markdown:
+            payload["markdown_content"] = args.markdown
         elif args.description:
             payload["description"] = args.description
-        if args.description_file:
-            with open(args.description_file) as f:
-                payload["markdown_content"] = f.read()
         if args.status:
             payload["status"] = args.status
         if args.priority is not None:
@@ -412,12 +408,12 @@ def main():
     tsp.add_parser("get").add_argument("task_id")
     tc = tsp.add_parser("create")
     tc.add_argument("list_id"); tc.add_argument("--name", required=True); tc.add_argument("--description")
-    tc.add_argument("--description-file"); tc.add_argument("--parent"); tc.add_argument("--assignees")
+    tc.add_argument("--markdown"); tc.add_argument("--parent"); tc.add_argument("--assignees")
     tc.add_argument("--priority", type=int); tc.add_argument("--due-date")
     tc.add_argument("--tags"); tc.add_argument("--status")
     tu = tsp.add_parser("update")
     tu.add_argument("task_id"); tu.add_argument("--name"); tu.add_argument("--description")
-    tu.add_argument("--markdown-description"); tu.add_argument("--description-file")
+    tu.add_argument("--markdown")
     tu.add_argument("--status"); tu.add_argument("--priority", type=int); tu.add_argument("--due-date")
     tu.add_argument("--assignees")
     tsp.add_parser("delete").add_argument("task_id")
