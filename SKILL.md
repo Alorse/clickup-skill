@@ -23,6 +23,8 @@ task create <list_id> --name <n> [--description <d>] [--markdown <md>] [--parent
 task update <id> [--name <n>] [--description <d>] [--markdown <md>] [--status <s>] [--priority <1-4>] [--due-date <YYYY-MM-DD>] [--assignees <ids>]
 task delete <id>
 task list <list_id> [--statuses <s1,s2>] [--include-closed]
+task search [--team <id>] [--assignees <ids>] [--statuses <s1,s2>] [--include-closed] [--space-ids] [--folder-ids] [--list-ids] [--due-date-gt <date>] [--due-date-lt <date>]
+task move <task_id> --list-id <list_id>
 ```
 
 ### Comments

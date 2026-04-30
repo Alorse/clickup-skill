@@ -10,6 +10,9 @@ Commands:
   task delete <id>
   task list <list_id> [--statuses <s1,s2>] [--include-closed] [--page <n>]
   task search [--team <id>] [--assignees <ids>] [--statuses <s1,s2>] [--include-closed]
+               [--space-ids <ids>] [--folder-ids <ids>] [--list-ids <ids>]
+               [--due-date-gt <YYYY-MM-DD>] [--due-date-lt <YYYY-MM-DD>]
+  task move <task_id> --list-id <list_id>
 
   comment list <task_id>
   comment add <task_id> <text> [--notify-all]
@@ -54,7 +57,10 @@ from datetime import datetime, timezone
 API_BASE = "https://api.clickup.com/api/v2"
 DEFAULT_TEAM = "529"  # Ventura
 
-def api(path, method="GET", data=None, params=None):
+def api(path, method="GET", data=None, params=None, array_params=None):
+    """Make API request.
+    array_params: list of keys that should be repeated (e.g. ?statuses[]=open&statuses[]=in%20progress)
+    """
     token = os.environ.get("CLICKUP_API_KEY", "")
     if not token:
         print("Error: CLICKUP_API_KEY not set", file=sys.stderr)
@@ -62,8 +68,16 @@ def api(path, method="GET", data=None, params=None):
 
     url = f"{API_BASE}{path}"
     if params:
-        qs = "&".join(f"{k}={urllib.parse.quote(str(v))}" for k, v in params.items())
-        url += f"?{qs}"
+        parts = []
+        for k, v in params.items():
+            if array_params and k in array_params:
+                for item in v.split(","):
+                    if item.strip():
+                        parts.append(f"{k}[]={urllib.parse.quote(item.strip())}")
+            else:
+                parts.append(f"{k}={urllib.parse.quote(str(v))}")
+        if parts:
+            url += "?" + "&".join(parts)
 
     req = urllib.request.Request(url, method=method)
     req.add_header("Authorization", token)
@@ -188,7 +202,7 @@ def cmd_task(args):
             params["include_closed"] = "true"
         if args.page is not None:
             params["page"] = str(args.page)
-        res = api(f"/list/{args.list_id}/task", params=params)
+        res = api(f"/list/{args.list_id}/task", params=params, array_params=["statuses"])
         tasks = res.get("tasks", [])
         print(f"Tasks ({len(tasks)}):")
         for t in tasks:
@@ -198,9 +212,37 @@ def cmd_task(args):
             print(f"  {t['id']} [{t['status']['status']}]{due} — {t['name'][:80]}")
 
     elif sub == "search":
-        # Filter tasks by list. Use hierarchy to find all lists first if needed.
-        print("Use 'task list <list_id>' to view tasks in a specific list.")
-        print("Use 'hierarchy' to discover list IDs.")
+        params = {"team_id": args.team or DEFAULT_TEAM}
+        if args.statuses:
+            params["statuses"] = args.statuses
+        if args.assignees:
+            params["assignees"] = args.assignees
+        if args.include_closed:
+            params["include_closed"] = "true"
+        if args.space_ids:
+            params["space_ids"] = args.space_ids
+        if args.folder_ids:
+            params["project_ids"] = args.folder_ids
+        if args.list_ids:
+            params["list_ids"] = args.list_ids
+        if args.due_date_gt:
+            params["due_date_gt"] = str(date_to_epoch(args.due_date_gt))
+        if args.due_date_lt:
+            params["due_date_lt"] = str(date_to_epoch(args.due_date_lt))
+        if args.page is not None:
+            params["page"] = str(args.page)
+        res = api(f"/team/{DEFAULT_TEAM}/task", params=params, array_params=["statuses", "assignees", "space_ids", "project_ids", "list_ids"])
+        tasks = res.get("tasks", [])
+        print(f"Tasks ({len(tasks)}):")
+        for t in tasks:
+            due = ""
+            if t.get("due_date"):
+                due = f" due:{datetime.fromtimestamp(int(t['due_date'])/1000).strftime('%m-%d')}"
+            print(f"  {t['id']} [{t['status']['status']}]{due} — {t['name'][:80]}")
+
+    elif sub == "move":
+        api(f"/list/{args.list_id}/task/{args.task_id}", method="POST")
+        print(f"Moved {args.task_id} to list {args.list_id}")
 
 # ─── Comments ─────────────────────────────────────────────────────────────
 
@@ -423,6 +465,11 @@ def main():
     ts = tsp.add_parser("search")
     ts.add_argument("--team", default=DEFAULT_TEAM); ts.add_argument("--assignees")
     ts.add_argument("--statuses"); ts.add_argument("--include-closed", action="store_true")
+    ts.add_argument("--space-ids"); ts.add_argument("--folder-ids"); ts.add_argument("--list-ids")
+    ts.add_argument("--due-date-gt"); ts.add_argument("--due-date-lt")
+    ts.add_argument("--page", type=int)
+    tm = tsp.add_parser("move")
+    tm.add_argument("task_id"); tm.add_argument("--list-id", required=True)
 
     # comment
     cp = sub.add_parser("comment")
