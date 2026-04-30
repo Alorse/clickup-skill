@@ -20,7 +20,7 @@ Token is read from `$CLICKUP_API_KEY` (set in settings.json).
 ```
 task get <id>
 task create <list_id> --name <n> [--description <d>] [--description-file <path>] [--parent <task_id>] [--assignees <ids>] [--priority <1-4>] [--due-date <YYYY-MM-DD>] [--tags <t1,t2>] [--status <s>]
-task update <id> [--name <n>] [--description <d>] [--status <s>] [--priority <1-4>] [--due-date <YYYY-MM-DD>] [--assignees <ids>]
+task update <id> [--name <n>] [--description <d>] [--markdown-description <md>] [--description-file <path>] [--status <s>] [--priority <1-4>] [--due-date <YYYY-MM-DD>] [--assignees <ids>]
 task delete <id>
 task list <list_id> [--statuses <s1,s2>] [--include-closed]
 ```
@@ -92,3 +92,5 @@ python3 ~/.claude/skills/clickup/scripts/clickup.py comment list 86c9k6jxf
 | 88724563 | Alex Callisaya (user) |
 
 Priority: `1`=urgent, `2`=high, `3`=normal, `4`=low.
+
+**Note on descriptions**: `--description` is plain text. Use `--markdown-description` or `--description-file` (reads file as markdown) for formatted content.
