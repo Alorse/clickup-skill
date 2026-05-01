@@ -12,7 +12,7 @@ description: |
 
 Script: `python3 ~/.claude/skills/clickup/scripts/clickup.py <cmd> [args]`
 
-Token is read from `$CLICKUP_API_KEY` (set in settings.json).
+Token is read from `$CLICKUP_API_KEY`. Set it in your shell (e.g. `~/.zshrc`) for global access.
 
 ## Commands
 

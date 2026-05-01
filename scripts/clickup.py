@@ -49,13 +49,18 @@ Commands:
 import os
 import sys
 import json
+import time
+import urllib.parse
 import urllib.request
 import urllib.error
 import argparse
 from datetime import datetime, timezone
 
+MAX_RETRIES = 3
+RETRY_DELAY = 2
+
 API_BASE = "https://api.clickup.com/api/v2"
-DEFAULT_TEAM = "529"  # Ventura
+DEFAULT_TEAM = os.environ.get("CLICKUP_TEAM_ID", "529")
 
 def api(path, method="GET", data=None, params=None, array_params=None):
     """Make API request.
@@ -87,18 +92,24 @@ def api(path, method="GET", data=None, params=None, array_params=None):
     else:
         body = None
 
-    try:
-        with urllib.request.urlopen(req, data=body, timeout=30) as resp:
-            raw = resp.read().decode()
-            return json.loads(raw) if raw else {}
-    except urllib.error.HTTPError as e:
-        err = e.read().decode()
+    delay = RETRY_DELAY
+    for attempt in range(MAX_RETRIES):
         try:
-            detail = json.loads(err)
-        except json.JSONDecodeError:
-            detail = {"raw": err}
-        print(f"HTTP {e.code}: {detail}", file=sys.stderr)
-        sys.exit(1)
+            with urllib.request.urlopen(req, data=body, timeout=30) as resp:
+                raw = resp.read().decode()
+                return json.loads(raw) if raw else {}
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and attempt < MAX_RETRIES - 1:
+                time.sleep(delay)
+                delay *= 2
+                continue
+            err = e.read().decode()
+            try:
+                detail = json.loads(err)
+            except json.JSONDecodeError:
+                detail = {"raw": err}
+            print(f"HTTP {e.code}: {detail}", file=sys.stderr)
+            sys.exit(1)
 
 def date_to_epoch(d):
     """Convert YYYY-MM-DD to epoch ms."""
@@ -273,7 +284,7 @@ def cmd_hierarchy(args):
         for l in res.get("lists", []):
             print(f"  └ (root) List: {l['name']} ({l['id']})")
     else:
-        res = api(f"/team/{DEFAULT_TEAM}/space")
+        res = api(f"/team/{args.team or DEFAULT_TEAM}/space")
         for s in res.get("spaces", []):
             print(f"Space: {s['name']} ({s['id']})")
 
@@ -367,7 +378,7 @@ def cmd_dependency(args):
 # ─── Time Tracking ────────────────────────────────────────────────────────
 
 def cmd_time(args):
-    tid = DEFAULT_TEAM
+    tid = args.team or DEFAULT_TEAM
     if args.sub == "status":
         res = api(f"/team/{tid}/time_entries/current")
         if res.get("data"):
@@ -439,7 +450,6 @@ def cmd_custom_fields(args):
 # ─── Main ─────────────────────────────────────────────────────────────────
 
 def main():
-    import urllib.parse  # late import for api()
 
     parser = argparse.ArgumentParser(description="ClickUp CLI")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -481,6 +491,7 @@ def main():
     # hierarchy
     hp = sub.add_parser("hierarchy")
     hp.add_argument("--space")
+    hp.add_argument("--team")
 
     # space/folder/list
     sp = sub.add_parser("space"); sp.add_argument("space_id")
@@ -518,6 +529,7 @@ def main():
 
     # time
     tmp = sub.add_parser("time")
+    tmp.add_argument("--team")
     tmsp = tmp.add_subparsers(dest="sub", required=True)
     tmsp.add_parser("status")
     tms = tmsp.add_parser("start"); tms.add_argument("task_id"); tms.add_argument("--description"); tms.add_argument("--billable", action="store_true")
