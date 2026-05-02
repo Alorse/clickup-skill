@@ -60,7 +60,7 @@ MAX_RETRIES = 3
 RETRY_DELAY = 2
 
 API_BASE = "https://api.clickup.com/api/v2"
-DEFAULT_TEAM = os.environ.get("CLICKUP_TEAM_ID", "529")
+DEFAULT_TEAM = os.environ.get("CLICKUP_TEAM_ID", "")
 
 def api(path, method="GET", data=None, params=None, array_params=None):
     """Make API request.
@@ -223,7 +223,11 @@ def cmd_task(args):
             print(f"  {t['id']} [{t['status']['status']}]{due} — {t['name'][:80]}")
 
     elif sub == "search":
-        params = {"team_id": args.team or DEFAULT_TEAM}
+        team_id = args.team or DEFAULT_TEAM
+        if not team_id:
+            print("Error: team ID required. Set CLICKUP_TEAM_ID or pass --team", file=sys.stderr)
+            sys.exit(1)
+        params = {"team_id": team_id}
         if args.statuses:
             params["statuses"] = args.statuses
         if args.assignees:
@@ -242,7 +246,7 @@ def cmd_task(args):
             params["due_date_lt"] = str(date_to_epoch(args.due_date_lt))
         if args.page is not None:
             params["page"] = str(args.page)
-        res = api(f"/team/{DEFAULT_TEAM}/task", params=params, array_params=["statuses", "assignees", "space_ids", "project_ids", "list_ids"])
+        res = api(f"/team/{team_id}/task", params=params, array_params=["statuses", "assignees", "space_ids", "project_ids", "list_ids"])
         tasks = res.get("tasks", [])
         print(f"Tasks ({len(tasks)}):")
         for t in tasks:

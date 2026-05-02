@@ -57,7 +57,7 @@ Set these environment variables in your shell profile (e.g. `~/.zshrc` or `~/.ba
 
 ```bash
 export CLICKUP_API_KEY="pk_YOUR_TOKEN_HERE"
-export CLICKUP_TEAM_ID="529"           # optional; defaults to 529
+export CLICKUP_TEAM_ID="YOUR_TEAM_ID"  # required for time tracking and search
 ```
 
 Then reload:
