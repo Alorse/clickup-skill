@@ -82,15 +82,4 @@ python3 ~/.claude/skills/clickup/scripts/clickup.py folder 7363089
 python3 ~/.claude/skills/clickup/scripts/clickup.py comment list 86c9k6jxf
 ```
 
-## Key IDs
-
-| ID | Name |
-|----|------|
-| 529 | Ventura (workspace) |
-| 3215874 | Teams (space) |
-| 7363089 | Across Departments (folder) |
-| 901522906120 | vMeets (list) |
-| 2440239 | Alfredo Ortegón (user) |
-| 88724563 | Alex Callisaya (user) |
-
 Priority: `1`=urgent, `2`=high, `3`=normal, `4`=low.
