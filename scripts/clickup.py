@@ -49,6 +49,7 @@ Commands:
 import os
 import sys
 import json
+import re
 import time
 import urllib.parse
 import urllib.request
@@ -123,7 +124,6 @@ def dt_to_epoch(dt_str):
 
 def parse_duration(dur_str):
     """Parse '1h 30m' or '90m' to minutes."""
-    import re
     total = 0
     m = re.search(r"(\d+)h", dur_str)
     if m:
@@ -133,14 +133,27 @@ def parse_duration(dur_str):
         total += int(m.group(1))
     return total * 60 * 1000  # epoch ms
 
+def _is_custom_id(task_id):
+    """Check if task_id matches custom ID format (e.g. ABC-12345)."""
+    return bool(re.search(r'^[A-Z]+-\d+$', task_id))
+
+def _custom_task_params(task_id, team_id):
+    """Return custom_task_ids=true + team_id params when task_id is a custom ID."""
+    if _is_custom_id(task_id) and team_id:
+        return {"custom_task_ids": "true", "team_id": team_id}
+    return {}
+
 # ─── Tasks ────────────────────────────────────────────────────────────────
 
 def cmd_task(args):
     sub = args.sub
     if sub == "get":
-        res = api(f"/task/{args.task_id}")
+        res = api(f"/task/{args.task_id}", params=_custom_task_params(args.task_id, DEFAULT_TEAM))
         t = res
         print(f"ID: {t['id']}")
+        custom_id = t.get("custom_id")
+        if custom_id:
+            print(f"Custom ID: {custom_id}")
         print(f"Name: {t['name']}")
         print(f"Status: {t['status']['status']}")
         p = t.get("priority") or {}
@@ -198,11 +211,11 @@ def cmd_task(args):
         if not payload:
             print("Nothing to update")
             return
-        res = api(f"/task/{args.task_id}", method="PUT", data=payload)
+        res = api(f"/task/{args.task_id}", method="PUT", data=payload, params=_custom_task_params(args.task_id, DEFAULT_TEAM))
         print(f"Updated: {res.get('id')}")
 
     elif sub == "delete":
-        api(f"/task/{args.task_id}", method="DELETE")
+        api(f"/task/{args.task_id}", method="DELETE", params=_custom_task_params(args.task_id, DEFAULT_TEAM))
         print(f"Deleted: {args.task_id}")
 
     elif sub == "list":
@@ -256,14 +269,14 @@ def cmd_task(args):
             print(f"  {t['id']} [{t['status']['status']}]{due} — {t['name'][:80]}")
 
     elif sub == "move":
-        api(f"/list/{args.list_id}/task/{args.task_id}", method="POST")
+        api(f"/list/{args.list_id}/task/{args.task_id}", method="POST", params=_custom_task_params(args.task_id, DEFAULT_TEAM))
         print(f"Moved {args.task_id} to list {args.list_id}")
 
 # ─── Comments ─────────────────────────────────────────────────────────────
 
 def cmd_comment(args):
     if args.sub == "list":
-        res = api(f"/task/{args.task_id}/comment")
+        res = api(f"/task/{args.task_id}/comment", params=_custom_task_params(args.task_id, DEFAULT_TEAM))
         for c in res.get("comments", []):
             u = c.get("user", {})
             date = datetime.fromtimestamp(int(c["date"])/1000).strftime("%Y-%m-%d %H:%M")
@@ -272,7 +285,7 @@ def cmd_comment(args):
         data = {"comment_text": args.text}
         if args.notify_all:
             data["notify_all"] = True
-        res = api(f"/task/{args.task_id}/comment", method="POST", data=data)
+        res = api(f"/task/{args.task_id}/comment", method="POST", data=data, params=_custom_task_params(args.task_id, DEFAULT_TEAM))
         print(f"Comment added: {res.get('id')}")
 
 # ─── Hierarchy ────────────────────────────────────────────────────────────
@@ -361,10 +374,10 @@ def cmd_workspace(args):
 
 def cmd_tag(args):
     if args.sub == "add":
-        api(f"/task/{args.task_id}/tag/{args.tag_name}", method="POST")
+        api(f"/task/{args.task_id}/tag/{args.tag_name}", method="POST", params=_custom_task_params(args.task_id, DEFAULT_TEAM))
         print(f"Tag '{args.tag_name}' added to {args.task_id}")
     elif args.sub == "remove":
-        api(f"/task/{args.task_id}/tag/{args.tag_name}", method="DELETE")
+        api(f"/task/{args.task_id}/tag/{args.tag_name}", method="DELETE", params=_custom_task_params(args.task_id, DEFAULT_TEAM))
         print(f"Tag '{args.tag_name}' removed from {args.task_id}")
 
 # ─── Dependencies ─────────────────────────────────────────────────────────
@@ -373,10 +386,12 @@ def cmd_dependency(args):
     t = args.type or "waiting_on"
     if args.sub == "add":
         data = {"depends_on": args.depends_on} if t == "waiting_on" else {"dependency_of": args.depends_on}
-        api(f"/task/{args.task_id}/dependency", method="POST", data=data)
+        api(f"/task/{args.task_id}/dependency", method="POST", data=data, params=_custom_task_params(args.task_id, DEFAULT_TEAM))
         print(f"Dependency added: {args.task_id} {t} {args.depends_on}")
     elif args.sub == "remove":
-        api(f"/task/{args.task_id}/dependency?depends_on={args.depends_on}", method="DELETE")
+        params = {"depends_on": args.depends_on}
+        params.update(_custom_task_params(args.task_id, DEFAULT_TEAM))
+        api(f"/task/{args.task_id}/dependency", method="DELETE", params=params)
         print(f"Dependency removed")
 
 # ─── Time Tracking ────────────────────────────────────────────────────────
@@ -416,7 +431,7 @@ def cmd_time(args):
         api(f"/team/{tid}/time_entries", method="POST", data=data)
         print(f"Time entry added to {args.task_id}")
     elif args.sub == "entries":
-        res = api(f"/task/{args.task_id}/time_entries")
+        res = api(f"/task/{args.task_id}/time_entries", params=_custom_task_params(args.task_id, DEFAULT_TEAM))
         for e in res.get("data", []):
             dur = int(e.get("duration", 0)) // 1000
             h, m = dur // 3600, (dur % 3600) // 60
