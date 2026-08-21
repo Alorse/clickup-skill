@@ -66,6 +66,14 @@ Then reload:
 source ~/.zshrc
 ```
 
+### Command on PATH (optional)
+
+The script is executable (shebang included), so you can symlink it once and use the short `clickup` command anywhere — same pattern the examples in SKILL.md use:
+
+```bash
+ln -s "$(pwd)/scripts/clickup.py" ~/.local/bin/clickup
+```
+
 ### Workspace (team) ID
 
 `CLICKUP_TEAM_ID` is optional. Commands that need a workspace resolve it from
