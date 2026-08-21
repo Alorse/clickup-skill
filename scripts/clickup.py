@@ -4,8 +4,8 @@ ClickUp CLI — token-efficient wrapper around the REST API.
 Usage: python3 clickup.py <command> [args...]
 
 Commands:
-  task get <id>
-  task create <list_id> --name <n> [--description <d>] [--assignees <ids>] [--priority <1-4>] [--due-date <YYYY-MM-DD>] [--tags <t1,t2>] [--status <s>]
+  task get <id>                  (shows list/folder/space IDs — use these for subtasks)
+  task create [list_id] --name <n> [--parent <task_id>] [--description <d>] [--assignees <ids>] [--priority <1-4>] [--due-date <YYYY-MM-DD>] [--tags <t1,t2>] [--status <s>]
   task update <id> [--name <n>] [--description <d>] [--status <s>] [--priority <1-4>] [--due-date <YYYY-MM-DD>] [--assignees <ids>]
   task delete <id>
   task list <list_id> [--statuses <s1,s2>] [--include-closed] [--page <n>]
@@ -15,12 +15,13 @@ Commands:
   task move <task_id> --list-id <list_id>
 
   comment list <task_id>
-  comment add <task_id> <text> [--notify-all]
+  comment add <task_id> <text> [--notify-all] [--mention <ids-names-or-emails>]
 
   hierarchy [--space <id>]
   space get <id>
   folder get <id>
   list get <id>
+  list find <name> [--team <id>]   (resolve a list name to its list_id, searches whole workspace)
   list create <space_id> --name <n> [--content <c>]
   list fields <list_id>
 
@@ -190,14 +191,34 @@ def cmd_task(args):
         print(f"Creator: {t.get('creator',{}).get('username','?')}")
         print(f"Assignees: {', '.join(a['username'] for a in t.get('assignees',[]))}")
         print(f"Tags: {', '.join(g['name'] for g in t.get('tags',[]))}")
-        print(f"List: {t.get('list',{}).get('name','?')}")
-        print(f"Folder: {t.get('folder',{}).get('name','?')}")
+        print(f"List: {t.get('list',{}).get('name','?')} (id: {t.get('list',{}).get('id','?')})")
+        print(f"Folder: {t.get('folder',{}).get('name','?')} (id: {t.get('folder',{}).get('id','?')})")
+        print(f"Space ID: {t.get('space',{}).get('id','?')}")
+        if t.get("parent"):
+            print(f"Parent: {t['parent']}")
         print(f"URL: https://app.clickup.com/t/{t['id']}")
         desc = t.get("description", "")
         if desc:
             print(f"\nDescription:\n{desc}")
 
     elif sub == "create":
+        list_id = args.list_id
+        parent_id = args.parent
+        # POST /list/{id}/task does not resolve custom IDs in the `parent` body
+        # field, so a custom parent must be turned into its native ID first.
+        # The same lookup yields the parent's list when none was given.
+        if args.parent and (not list_id or _is_custom_id(args.parent)):
+            parent = api(f"/task/{args.parent}", params=_custom_task_params(args.parent))
+            parent_id = parent.get("id", args.parent)
+            if not list_id:
+                list_id = parent.get("list", {}).get("id")
+                if not list_id:
+                    print(f"Error: could not resolve list from parent task {args.parent}", file=sys.stderr)
+                    sys.exit(1)
+                print(f"(list_id {list_id} inherited from parent {args.parent})")
+        if not list_id:
+            print("Error: provide <list_id>, or --parent to inherit the parent task's list", file=sys.stderr)
+            sys.exit(1)
         payload = {"name": args.name}
         if args.description:
             payload["description"] = args.description
@@ -213,9 +234,9 @@ def cmd_task(args):
             payload["tags"] = args.tags.split(",")
         if args.status:
             payload["status"] = args.status
-        if args.parent:
-            payload["parent"] = args.parent
-        res = api(f"/list/{args.list_id}/task", method="POST", data=payload)
+        if parent_id:
+            payload["parent"] = parent_id
+        res = api(f"/list/{list_id}/task", method="POST", data=payload)
         print(f"Created: {res.get('id')} — {res.get('name')}")
 
     elif sub == "update":
@@ -297,6 +318,43 @@ def cmd_task(args):
 
 # ─── Comments ─────────────────────────────────────────────────────────────
 
+def _resolve_mentions(tokens):
+    """Resolve --mention tokens (numeric user IDs, names, or emails) into
+    [{"id", "username"}] by scanning workspace members. Fails loud: an unmatched
+    or ambiguous name/email aborts rather than silently dropping the mention
+    (a dropped mention = a person who never gets notified)."""
+    members = []  # (id, username, email)
+    for t in api("/team").get("teams", []):
+        for m in t.get("members", []):
+            u = m.get("user", {})
+            if u.get("id") is not None:
+                members.append((u["id"], u.get("username") or "", u.get("email") or ""))
+    by_id = {mid: (name, email) for mid, name, email in members}
+
+    resolved, errors = [], []
+    for raw in [t.strip() for t in tokens if t.strip()]:
+        if raw.isdigit():
+            uid = int(raw)
+            # An ID outside the member list (e.g. a guest) is trusted as-is:
+            # the mention still notifies through the id.
+            resolved.append({"id": uid, "username": by_id.get(uid, ("", ""))[0]})
+            continue
+        q = raw.lower()
+        hits = {mid: name for mid, name, email in members
+                if q == email.lower() or q == name.lower() or q in name.lower() or q in email.lower()}
+        if len(hits) == 1:
+            mid = next(iter(hits))
+            resolved.append({"id": mid, "username": hits[mid]})
+        elif not hits:
+            errors.append(f"no workspace member matches '{raw}'")
+        else:
+            opts = ", ".join(f"{n} ({i})" for i, n in hits.items())
+            errors.append(f"'{raw}' is ambiguous — matches: {opts}. Use a numeric ID.")
+    if errors:
+        print("Error resolving --mention:\n  - " + "\n  - ".join(errors), file=sys.stderr)
+        sys.exit(1)
+    return resolved
+
 def cmd_comment(args):
     if args.sub == "list":
         res = api(f"/task/{args.task_id}/comment", params=_custom_task_params(args.task_id))
@@ -305,7 +363,18 @@ def cmd_comment(args):
             date = datetime.fromtimestamp(int(c["date"])/1000).strftime("%Y-%m-%d %H:%M")
             print(f"[{date}] {u.get('username','?')}: {c.get('comment_text','')}")
     elif args.sub == "add":
-        data = {"comment_text": args.text}
+        mentions = _resolve_mentions(args.mention.split(",")) if args.mention else []
+        if mentions:
+            # ClickUp only creates a real @mention through the structured
+            # `comment` array; plain `comment_text` is stored as literal text and
+            # notifies nobody. Each mention becomes a {type: tag, user: {id}}
+            # fragment — the display label is cosmetic, user.id drives the notify.
+            fragments = [{"text": "@" + (m["username"] or ""), "type": "tag", "user": {"id": m["id"]}}
+                         for m in mentions]
+            fragments.append({"text": (" " + args.text) if args.text else ""})
+            data = {"comment": fragments}
+        else:
+            data = {"comment_text": args.text}
         if args.notify_all:
             data["notify_all"] = True
         res = api(f"/task/{args.task_id}/comment", method="POST", data=data, params=_custom_task_params(args.task_id))
@@ -339,7 +408,25 @@ def cmd_folder(args):
         print(f"  List: {l['name']} ({l['id']})")
 
 def cmd_list(args):
-    if args.sub == "get":
+    if args.sub == "find":
+        q = args.name.lower()
+        tid = resolve_team(args.team)
+        matches = []
+        for sp in api(f"/team/{tid}/space").get("spaces", []):
+            sid, sname = sp["id"], sp["name"]
+            for f in api(f"/space/{sid}/folder").get("folders", []):
+                for l in f.get("lists", []):
+                    if q in l["name"].lower():
+                        matches.append((l["id"], l["name"], f"{sname} > {f['name']}"))
+            for l in api(f"/space/{sid}/list").get("lists", []):
+                if q in l["name"].lower():
+                    matches.append((l["id"], l["name"], sname))
+        if not matches:
+            print(f"No lists matching '{args.name}'")
+            sys.exit(1)
+        for lid, lname, path in matches:
+            print(f"{lid} — {lname}  [{path}]")
+    elif args.sub == "get":
         res = api(f"/list/{args.list_id}")
         print(f"ID: {res['id']}\nName: {res['name']}\nContent: {res.get('content','')}")
     elif args.sub == "create":
@@ -501,7 +588,7 @@ def main():
     tsp = tp.add_subparsers(dest="sub", required=True)
     tsp.add_parser("get").add_argument("task_id")
     tc = tsp.add_parser("create")
-    tc.add_argument("list_id"); tc.add_argument("--name", required=True); tc.add_argument("--description")
+    tc.add_argument("list_id", nargs="?"); tc.add_argument("--name", required=True); tc.add_argument("--description")
     tc.add_argument("--markdown"); tc.add_argument("--parent"); tc.add_argument("--assignees")
     tc.add_argument("--priority", type=int); tc.add_argument("--due-date")
     tc.add_argument("--tags"); tc.add_argument("--status")
@@ -529,6 +616,7 @@ def main():
     csp.add_parser("list").add_argument("task_id")
     ca = csp.add_parser("add")
     ca.add_argument("task_id"); ca.add_argument("text"); ca.add_argument("--notify-all", action="store_true")
+    ca.add_argument("--mention", help="Comma-separated user IDs, names, or emails to @mention (real, notifying mention; ambiguous names abort)")
 
     # hierarchy
     hp = sub.add_parser("hierarchy")
@@ -541,6 +629,8 @@ def main():
     lp = sub.add_parser("list")
     lsp = lp.add_subparsers(dest="sub", required=True)
     lsp.add_parser("get").add_argument("list_id")
+    lf = lsp.add_parser("find")
+    lf.add_argument("name"); lf.add_argument("--team")
     lc = lsp.add_parser("create")
     lc.add_argument("space_id"); lc.add_argument("--name", required=True); lc.add_argument("--content"); lc.add_argument("--folder")
     lsp.add_parser("fields").add_argument("list_id")
