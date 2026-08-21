@@ -10,7 +10,17 @@ description: |
 
 # ClickUp CLI
 
-Script: `python3 ~/.claude/skills/clickup/scripts/clickup.py <cmd> [args]`
+The script is `scripts/clickup.py` inside this skill's directory (Python 3, stdlib only).
+
+**Get it on your PATH (recommended).** The file is executable (shebang included), so install it once with a symlink:
+
+```bash
+ln -s <absolute-path-to-this-skill>/scripts/clickup.py ~/.local/bin/clickup
+```
+
+Then call `clickup <cmd> [args]` from anywhere. If you haven't symlinked it, invoke it by its full path — the skill root differs per agent: `~/.claude/skills/clickup/scripts/clickup.py` (Claude Code) or `~/.hermes/skills/ventura/clickup/scripts/clickup.py` (Hermes).
+
+All examples below use `clickup` — substitute the full path if you haven't installed the symlink.
 
 Token is read from `$CLICKUP_API_KEY`. Set it in your shell (e.g. `~/.zshrc`) for global access.
 
@@ -44,7 +54,7 @@ task move <task_id> --list-id <list_id>
 omitted: the script resolves it from the parent task (and resolves a custom parent
 ID to its native one, which the create endpoint requires).
 ```bash
-python3 ~/.claude/skills/clickup/scripts/clickup.py task create --parent 86ca6t7y8 --name "Subtask title" --markdown "..."
+clickup task create --parent 86ca6t7y8 --name "Subtask title" --markdown "..."
 ```
 If you do need a list_id explicitly, `task get <id>` prints it (`List: name (id: ...)`),
 or resolve one by name with `list find <name>`.
@@ -61,9 +71,9 @@ their user ID, name, or email (comma-separated for several). Names and emails ar
 resolved against workspace members; an unmatched or ambiguous one aborts, so nobody
 is silently left un-notified — pass a numeric ID to disambiguate.
 ```bash
-python3 ~/.claude/skills/clickup/scripts/clickup.py comment add 86ca141ey "Summary text" --mention "Jane Doe"
-python3 ~/.claude/skills/clickup/scripts/clickup.py comment add 86ca141ey "Summary" --mention jane.doe@example.com
-python3 ~/.claude/skills/clickup/scripts/clickup.py comment add 86ca141ey "Summary" --mention 12345678,"John Roe"
+clickup comment add 86ca141ey "Summary text" --mention "Jane Doe"
+clickup comment add 86ca141ey "Summary" --mention jane.doe@example.com
+clickup comment add 86ca141ey "Summary" --mention 12345678,"John Roe"
 ```
 
 ### Folders, Lists, Spaces
@@ -110,10 +120,10 @@ custom-fields <list_id>
 ## Examples
 
 ```bash
-python3 ~/.claude/skills/clickup/scripts/clickup.py task get 86c9k6jxf
-python3 ~/.claude/skills/clickup/scripts/clickup.py user find jane
-python3 ~/.claude/skills/clickup/scripts/clickup.py list find "Sprint Backlog"
-python3 ~/.claude/skills/clickup/scripts/clickup.py comment list 86c9k6jxf
+clickup task get 86c9k6jxf
+clickup user find jane
+clickup list find "Sprint Backlog"
+clickup comment list 86c9k6jxf
 ```
 
 Priority: `1`=urgent, `2`=high, `3`=normal, `4`=low.
