@@ -254,7 +254,9 @@ def cmd_task(args):
         if args.due_date:
             payload["due_date"] = date_to_epoch(args.due_date)
         if args.assignees:
-            payload["assignees"] = [int(x) for x in args.assignees.split(",")]
+            # PUT /task requires the add/rem object shape; a flat list is
+            # silently ignored (unlike POST create, which takes a flat array).
+            payload["assignees"] = {"add": [int(x) for x in args.assignees.split(",")]}
         if not payload:
             print("Nothing to update")
             return
