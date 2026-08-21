@@ -61,7 +61,33 @@ MAX_RETRIES = 3
 RETRY_DELAY = 2
 
 API_BASE = "https://api.clickup.com/api/v2"
-DEFAULT_TEAM = os.environ.get("CLICKUP_TEAM_ID", "")
+_TEAM_ID = None
+
+def resolve_team(explicit=None):
+    """Resolve the workspace (team) ID: an explicit --team wins, then
+    $CLICKUP_TEAM_ID, then a live lookup of the workspaces this token can reach.
+    The lookup only decides when the token sees exactly one workspace; with
+    several we list them and stop rather than guess which one was meant."""
+    global _TEAM_ID
+    if explicit:
+        return explicit
+    if _TEAM_ID:
+        return _TEAM_ID
+    env = os.environ.get("CLICKUP_TEAM_ID", "").strip()
+    if env:
+        _TEAM_ID = env
+        return _TEAM_ID
+    teams = api("/team").get("teams", [])
+    if len(teams) == 1:
+        _TEAM_ID = teams[0]["id"]
+        return _TEAM_ID
+    if not teams:
+        print("Error: this token has access to no workspace", file=sys.stderr)
+    else:
+        opts = "\n".join(f"  {t['id']}  {t.get('name','?')}" for t in teams)
+        print("Error: token has access to several workspaces. Set CLICKUP_TEAM_ID "
+              f"(or pass --team where the command accepts it):\n{opts}", file=sys.stderr)
+    sys.exit(1)
 
 def api(path, method="GET", data=None, params=None, array_params=None):
     """Make API request.
@@ -137,10 +163,10 @@ def _is_custom_id(task_id):
     """Check if task_id matches custom ID format (e.g. ABC-12345)."""
     return bool(re.search(r'^[A-Z]+-\d+$', task_id))
 
-def _custom_task_params(task_id, team_id):
+def _custom_task_params(task_id):
     """Return custom_task_ids=true + team_id params when task_id is a custom ID."""
-    if _is_custom_id(task_id) and team_id:
-        return {"custom_task_ids": "true", "team_id": team_id}
+    if _is_custom_id(task_id):
+        return {"custom_task_ids": "true", "team_id": resolve_team()}
     return {}
 
 # ─── Tasks ────────────────────────────────────────────────────────────────
@@ -148,7 +174,7 @@ def _custom_task_params(task_id, team_id):
 def cmd_task(args):
     sub = args.sub
     if sub == "get":
-        res = api(f"/task/{args.task_id}", params=_custom_task_params(args.task_id, DEFAULT_TEAM))
+        res = api(f"/task/{args.task_id}", params=_custom_task_params(args.task_id))
         t = res
         print(f"ID: {t['id']}")
         custom_id = t.get("custom_id")
@@ -211,11 +237,11 @@ def cmd_task(args):
         if not payload:
             print("Nothing to update")
             return
-        res = api(f"/task/{args.task_id}", method="PUT", data=payload, params=_custom_task_params(args.task_id, DEFAULT_TEAM))
+        res = api(f"/task/{args.task_id}", method="PUT", data=payload, params=_custom_task_params(args.task_id))
         print(f"Updated: {res.get('id')}")
 
     elif sub == "delete":
-        api(f"/task/{args.task_id}", method="DELETE", params=_custom_task_params(args.task_id, DEFAULT_TEAM))
+        api(f"/task/{args.task_id}", method="DELETE", params=_custom_task_params(args.task_id))
         print(f"Deleted: {args.task_id}")
 
     elif sub == "list":
@@ -236,10 +262,7 @@ def cmd_task(args):
             print(f"  {t['id']} [{t['status']['status']}]{due} — {t['name'][:80]}")
 
     elif sub == "search":
-        team_id = args.team or DEFAULT_TEAM
-        if not team_id:
-            print("Error: team ID required. Set CLICKUP_TEAM_ID or pass --team", file=sys.stderr)
-            sys.exit(1)
+        team_id = resolve_team(args.team)
         params = {"team_id": team_id}
         if args.statuses:
             params["statuses"] = args.statuses
@@ -269,14 +292,14 @@ def cmd_task(args):
             print(f"  {t['id']} [{t['status']['status']}]{due} — {t['name'][:80]}")
 
     elif sub == "move":
-        api(f"/list/{args.list_id}/task/{args.task_id}", method="POST", params=_custom_task_params(args.task_id, DEFAULT_TEAM))
+        api(f"/list/{args.list_id}/task/{args.task_id}", method="POST", params=_custom_task_params(args.task_id))
         print(f"Moved {args.task_id} to list {args.list_id}")
 
 # ─── Comments ─────────────────────────────────────────────────────────────
 
 def cmd_comment(args):
     if args.sub == "list":
-        res = api(f"/task/{args.task_id}/comment", params=_custom_task_params(args.task_id, DEFAULT_TEAM))
+        res = api(f"/task/{args.task_id}/comment", params=_custom_task_params(args.task_id))
         for c in res.get("comments", []):
             u = c.get("user", {})
             date = datetime.fromtimestamp(int(c["date"])/1000).strftime("%Y-%m-%d %H:%M")
@@ -285,7 +308,7 @@ def cmd_comment(args):
         data = {"comment_text": args.text}
         if args.notify_all:
             data["notify_all"] = True
-        res = api(f"/task/{args.task_id}/comment", method="POST", data=data, params=_custom_task_params(args.task_id, DEFAULT_TEAM))
+        res = api(f"/task/{args.task_id}/comment", method="POST", data=data, params=_custom_task_params(args.task_id))
         print(f"Comment added: {res.get('id')}")
 
 # ─── Hierarchy ────────────────────────────────────────────────────────────
@@ -301,7 +324,7 @@ def cmd_hierarchy(args):
         for l in res.get("lists", []):
             print(f"  └ (root) List: {l['name']} ({l['id']})")
     else:
-        res = api(f"/team/{args.team or DEFAULT_TEAM}/space")
+        res = api(f"/team/{resolve_team(args.team)}/space")
         for s in res.get("spaces", []):
             print(f"Space: {s['name']} ({s['id']})")
 
@@ -357,7 +380,7 @@ def cmd_user(args):
 # ─── Workspace ────────────────────────────────────────────────────────────
 
 def cmd_workspace(args):
-    tid = args.team or DEFAULT_TEAM
+    tid = resolve_team(args.team)
     if args.sub == "members":
         res = api("/team")
         for t in res.get("teams", []):
@@ -374,10 +397,10 @@ def cmd_workspace(args):
 
 def cmd_tag(args):
     if args.sub == "add":
-        api(f"/task/{args.task_id}/tag/{args.tag_name}", method="POST", params=_custom_task_params(args.task_id, DEFAULT_TEAM))
+        api(f"/task/{args.task_id}/tag/{args.tag_name}", method="POST", params=_custom_task_params(args.task_id))
         print(f"Tag '{args.tag_name}' added to {args.task_id}")
     elif args.sub == "remove":
-        api(f"/task/{args.task_id}/tag/{args.tag_name}", method="DELETE", params=_custom_task_params(args.task_id, DEFAULT_TEAM))
+        api(f"/task/{args.task_id}/tag/{args.tag_name}", method="DELETE", params=_custom_task_params(args.task_id))
         print(f"Tag '{args.tag_name}' removed from {args.task_id}")
 
 # ─── Dependencies ─────────────────────────────────────────────────────────
@@ -386,18 +409,18 @@ def cmd_dependency(args):
     t = args.type or "waiting_on"
     if args.sub == "add":
         data = {"depends_on": args.depends_on} if t == "waiting_on" else {"dependency_of": args.depends_on}
-        api(f"/task/{args.task_id}/dependency", method="POST", data=data, params=_custom_task_params(args.task_id, DEFAULT_TEAM))
+        api(f"/task/{args.task_id}/dependency", method="POST", data=data, params=_custom_task_params(args.task_id))
         print(f"Dependency added: {args.task_id} {t} {args.depends_on}")
     elif args.sub == "remove":
         params = {"depends_on": args.depends_on}
-        params.update(_custom_task_params(args.task_id, DEFAULT_TEAM))
+        params.update(_custom_task_params(args.task_id))
         api(f"/task/{args.task_id}/dependency", method="DELETE", params=params)
         print(f"Dependency removed")
 
 # ─── Time Tracking ────────────────────────────────────────────────────────
 
 def cmd_time(args):
-    tid = args.team or DEFAULT_TEAM
+    tid = resolve_team(args.team)
     if args.sub == "status":
         res = api(f"/team/{tid}/time_entries/current")
         if res.get("data"):
@@ -431,7 +454,7 @@ def cmd_time(args):
         api(f"/team/{tid}/time_entries", method="POST", data=data)
         print(f"Time entry added to {args.task_id}")
     elif args.sub == "entries":
-        res = api(f"/task/{args.task_id}/time_entries", params=_custom_task_params(args.task_id, DEFAULT_TEAM))
+        res = api(f"/task/{args.task_id}/time_entries", params=_custom_task_params(args.task_id))
         for e in res.get("data", []):
             dur = int(e.get("duration", 0)) // 1000
             h, m = dur // 3600, (dur % 3600) // 60
@@ -492,7 +515,7 @@ def main():
     tl.add_argument("list_id"); tl.add_argument("--statuses"); tl.add_argument("--include-closed", action="store_true")
     tl.add_argument("--page", type=int)
     ts = tsp.add_parser("search")
-    ts.add_argument("--team", default=DEFAULT_TEAM); ts.add_argument("--assignees")
+    ts.add_argument("--team"); ts.add_argument("--assignees")
     ts.add_argument("--statuses"); ts.add_argument("--include-closed", action="store_true")
     ts.add_argument("--space-ids"); ts.add_argument("--folder-ids"); ts.add_argument("--list-ids")
     ts.add_argument("--due-date-gt"); ts.add_argument("--due-date-lt")

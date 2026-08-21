@@ -57,7 +57,7 @@ Set these environment variables in your shell profile (e.g. `~/.zshrc` or `~/.ba
 
 ```bash
 export CLICKUP_API_KEY="pk_YOUR_TOKEN_HERE"
-export CLICKUP_TEAM_ID="YOUR_TEAM_ID"  # required for time tracking and search
+export CLICKUP_TEAM_ID="YOUR_TEAM_ID"  # optional — see below
 ```
 
 Then reload:
@@ -66,11 +66,21 @@ Then reload:
 source ~/.zshrc
 ```
 
-### Finding your ClickUp Team ID
+### Workspace (team) ID
 
-```bash
-python3 scripts/clickup.py workspace spaces
+`CLICKUP_TEAM_ID` is optional. Commands that need a workspace resolve it from
+`--team`, then `$CLICKUP_TEAM_ID`, then a live lookup of the workspaces your token
+can reach. If the token sees exactly one workspace, that one is used and you never
+have to configure anything. If it sees several, the script lists them and stops
+rather than guessing:
+
 ```
+Error: token has access to several workspaces. Set CLICKUP_TEAM_ID (or pass --team where the command accepts it):
+  14785236    Acme
+  9011254269  Personal
+```
+
+Set the variable to the ID you want — that also saves one API round trip per run.
 
 ## Usage
 

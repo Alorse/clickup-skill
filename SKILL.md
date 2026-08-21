@@ -14,6 +14,12 @@ Script: `python3 ~/.claude/skills/clickup/scripts/clickup.py <cmd> [args]`
 
 Token is read from `$CLICKUP_API_KEY`. Set it in your shell (e.g. `~/.zshrc`) for global access.
 
+**Workspace (team) ID.** Nothing is hardcoded: commands that need a workspace take
+it from `--team`, else `$CLICKUP_TEAM_ID`, else a live lookup of the workspaces the
+token can reach. The lookup only decides when there is exactly one — with several
+the script lists them and stops, so set `CLICKUP_TEAM_ID` once to skip both the
+prompt and the extra request.
+
 ## Commands
 
 ### Tasks
