@@ -53,18 +53,17 @@ Operations marked as — are not yet implemented.
 
 ## First-Time Setup
 
-Set these environment variables in your shell profile (e.g. `~/.zshrc` or `~/.bashrc`):
+Supply the personal API token **out of band** as `CLICKUP_API_TOKEN`, or have
+an operator provision a private token file owned by the invoking user (mode
+`0600`). Do not put credentials in shell commands, examples, shell history, or
+agent prompts. `--token-file PATH` takes a **path**, never a token, and must
+precede the command. It overrides the environment. Symlinks, nonregular files,
+files owned by another user, and any group/other permissions are refused.
 
-```bash
-export CLICKUP_API_KEY="pk_YOUR_TOKEN_HERE"
-export CLICKUP_TEAM_ID="YOUR_TEAM_ID"  # optional — see below
-```
-
-Then reload:
-
-```bash
-source ~/.zshrc
-```
+`CLICKUP_API_KEY` is no longer accepted; migrate to `CLICKUP_API_TOKEN`.
+Upstream did not have an argv-token option; this fork also refuses `--token`
+and `--api-key` (and rejects the active token if accidentally supplied in argv).
+`CLICKUP_TEAM_ID` remains an optional numeric workspace ID.
 
 ### Command on PATH (optional)
 
@@ -79,16 +78,65 @@ ln -s "$(pwd)/scripts/clickup.py" ~/.local/bin/clickup
 `CLICKUP_TEAM_ID` is optional. Commands that need a workspace resolve it from
 `--team`, then `$CLICKUP_TEAM_ID`, then a live lookup of the workspaces your token
 can reach. If the token sees exactly one workspace, that one is used and you never
-have to configure anything. If it sees several, the script lists them and stops
-rather than guessing:
+have to configure anything. If it sees several or none, it returns a JSON error rather than guessing.
+Set the variable or use `--team` to select a workspace and save a lookup.
 
-```
-Error: token has access to several workspaces. Set CLICKUP_TEAM_ID (or pass --team where the command accepts it):
-  14785236    Acme
-  9011254269  Personal
+## Security and agent contract
+
+- All successful commands emit **one JSON value**, including full task details
+  (description and custom fields). Errors are JSON on stderr; stdout is empty
+  on failure. `--help` is human-readable. This replaces upstream's text output.
+- Credentials go only in `Authorization` to the fixed
+  `https://api.clickup.com/api/v2` origin. TLS certificate/hostname verification
+  stays enabled; environment proxies are ignored; **all redirects are refused**.
+  No API-base override, subprocesses, shell/eval calls, or application file writes.
+- Requests have a 30-second socket timeout. No automatic retries, especially for
+  writes: an ambiguous failure may already have committed a change. HTTP bodies,
+  URLs, reason phrases and tracebacks are never dumped. Echoed active credentials
+  are redacted in JSON (including object keys); credentials in URL/body are refused.
+- Exit codes: `0` success; `2` arguments/credentials; `3` HTTP/redirect failure;
+  `4` rate limited (429); `5` transport/TLS/timeout; `6` invalid API response or
+  pagination/internal failure. Errors include `http_status` when applicable;
+  429 also includes a safe numeric `retry_after` in seconds when supplied.
+- Read commands only issue GETs. Only explicit write commands can issue other
+  methods: `task create/update/delete/move`, `comment add`, `list create`,
+  `tag add/remove`, `dependency add/remove`, `time start/stop/add`.
+  **The calling agent must obtain explicit human approval before invoking any
+  of these.** The CLI cannot verify human approval and does not turn reads into writes.
+- Native task IDs are alphanumeric; custom IDs use `PREFIX-NUMBER`; resource/user
+  IDs are numeric. Invalid IDs, negative page/cursor values and malformed dates
+  fail without echoing their values. API response IDs used in follow-up paths are
+  validated too.
+
+### Pagination
+
+`task list` and `task search` fetch **all pages by default**, keeping filters on
+every request. They stop on `last_page: true` or an empty page, not a short page.
+`--page N` explicitly requests one zero-based page and includes `complete` and
+`next_page` in the result. These keys describe completion of traversal, not a
+transactional snapshot of a changing backlog.
+
+`comment list` fetches all top-level task comments, using both the oldest
+comment's `date` and `id` as the next `start`/`start_id` cursor. `--single-page`
+returns `next_cursor`; pass it back using `--start MS --start-id ID` to resume.
+Threaded replies are not included. Comments and tasks are deduplicated by ID.
+Responses are limited to 16 MiB per page and traversals to 10,000 pages; repeated
+pages/cursors or exceeded limits fail visibly with no partial success output.
+Results are aggregated in memory; large traversals may need substantial memory.
+Other legacy collection commands are not promised exhaustive pagination.
+
+## Offline verification
+
+```bash
+python3 -m py_compile scripts/clickup.py
+python3 -m unittest                         # unittest discovery, no live API
+python3 -m unittest tests.test_clickup.TokenLeakTests
+python3 -m tests.mutations                  # in-memory mutations; source untouched
 ```
 
-Set the variable to the ID you want — that also saves one API round trip per run.
+Tests use urllib mocks plus a loopback-only redirect server, synthetic tokens,
+and a process-wide guard rejecting non-loopback connects. See
+[SECURITY_REVIEW.md](SECURITY_REVIEW.md) for baseline findings and scope.
 
 ## Usage
 
@@ -98,8 +146,10 @@ Quick examples:
 
 ```bash
 python3 scripts/clickup.py task get 86c9k6jxf
-python3 scripts/clickup.py task list 901522906120
+python3 scripts/clickup.py task list 123456 --statuses "open,in progress" --include-closed --assignees 789
+python3 scripts/clickup.py task search --team 123 --assignees 789
+python3 scripts/clickup.py comment list 86c9k6jxf
+python3 scripts/clickup.py --token-file /secure/clickup-token task get 86c9k6jxf
 python3 scripts/clickup.py time status
-python3 scripts/clickup.py time start 86c9k6jxf
 python3 scripts/clickup.py hierarchy --team 12345
 ```

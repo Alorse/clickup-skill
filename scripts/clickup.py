@@ -1,588 +1,503 @@
 #!/usr/bin/env python3
-"""
-ClickUp CLI — token-efficient wrapper around the REST API.
-Usage: python3 clickup.py <command> [args...]
+"""ClickUp CLI — stdlib-only JSON wrapper around the REST API.
 
-Commands:
-  task get <id>                  (shows list/folder/space IDs — use these for subtasks)
-  task create [list_id] --name <n> [--parent <task_id>] [--description <d>] [--assignees <ids>] [--priority <1-4>] [--due-date <YYYY-MM-DD>] [--tags <t1,t2>] [--status <s>]
-  task update <id> [--name <n>] [--description <d>] [--status <s>] [--priority <1-4>] [--due-date <YYYY-MM-DD>] [--assignees <ids>]
-  task delete <id>
-  task list <list_id> [--statuses <s1,s2>] [--include-closed] [--page <n>]
-  task search [--team <id>] [--assignees <ids>] [--statuses <s1,s2>] [--include-closed]
-               [--space-ids <ids>] [--folder-ids <ids>] [--list-ids <ids>]
-               [--due-date-gt <YYYY-MM-DD>] [--due-date-lt <YYYY-MM-DD>]
-  task move <task_id> --list-id <list_id>
-
-  comment list <task_id>
-  comment add <task_id> <text> [--notify-all] [--mention <ids-names-or-emails>]
-
-  hierarchy [--space <id>]
-  space get <id>
-  folder get <id>
-  list get <id>
-  list find <name> [--team <id>]   (resolve a list name to its list_id, searches whole workspace)
-  list create <space_id> --name <n> [--content <c>]
-  list fields <list_id>
-
-  user info
-  user find <name-or-email>
-
-  workspace members [--team <id>]
-  workspace spaces [--team <id>]
-
-  tag add <task_id> <tag_name>
-  tag remove <task_id> <tag_name>
-
-  dependency add <task_id> --depends-on <id> [--type waiting_on|blocking]
-  dependency remove <task_id> --depends-on <id> [--type waiting_on|blocking]
-
-  time status
-  time start <task_id> [--description <d>] [--billable]
-  time stop [--description <d>]
-  time add <task_id> --start <YYYY-MM-DD HH:MM> [--duration <Xd Ym>] [--end <YYYY-MM-DD HH:MM>]
-  time entries <task_id>
-  time report --from <YYYY-MM-DD> --to <YYYY-MM-DD> [--assignee <id>]
-
-  custom-fields <list_id>
+Credentials: CLICKUP_API_TOKEN or --token-file PATH (before the command).
+Only explicit write commands may send non-GET requests. Human approval is
+an orchestration responsibility, not something a CLI can infer.
 """
 
 import os
 import sys
 import json
 import re
-import time
+import ssl
+import stat
 import urllib.parse
 import urllib.request
 import urllib.error
 import argparse
 from datetime import datetime, timezone
 
-MAX_RETRIES = 3
-RETRY_DELAY = 2
-
 API_BASE = "https://api.clickup.com/api/v2"
+REQUEST_TIMEOUT = 30
+MAX_RESPONSE_BYTES = 16 * 1024 * 1024
+MAX_PAGES = 10000
 _TEAM_ID = None
+_TOKEN = None
+_WRITE_ALLOWED = False
+WRITE_COMMANDS = {
+    ("task", "create"), ("task", "update"), ("task", "delete"), ("task", "move"),
+    ("comment", "add"), ("list", "create"), ("tag", "add"), ("tag", "remove"),
+    ("dependency", "add"), ("dependency", "remove"),
+    ("time", "start"), ("time", "stop"), ("time", "add"),
+}
+
+
+class CLIError(Exception):
+    """Only constant, non-sensitive messages belong in this exception."""
+    def __init__(self, message, code=2, **details):
+        super().__init__(message)
+        self.code = code
+        self.details = {"message": message, **details}
+
+
+class SafeParser(argparse.ArgumentParser):
+    def error(self, message):
+        # argparse's message may contain an argv value (including a secret).
+        raise CLIError("invalid arguments; use --help for command syntax")
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # Refuse even same-host redirects: no credential forwarding or replay.
+        return None
+
+
+def load_token(path=None):
+    if path:
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(fd, "rb") as stream:
+                info = os.fstat(stream.fileno())
+                if (not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077
+                        or info.st_uid != os.getuid()):
+                    raise CLIError("token file must be owned by this user and private (mode 0600)")
+                raw = stream.read(4098)
+            token = raw.decode("ascii").rstrip("\r\n")
+        except (OSError, UnicodeError):
+            raise CLIError("cannot read private regular token file") from None
+    else:
+        token = os.environ.get("CLICKUP_API_TOKEN", "")
+    if not token:
+        raise CLIError("set CLICKUP_API_TOKEN or use --token-file; CLICKUP_API_KEY is no longer accepted")
+    if len(token) > 4096 or not re.fullmatch(r"[!-~]+", token):
+        raise CLIError("invalid credential format")
+    return token
+
+
+def redact(value):
+    if isinstance(value, str):
+        return value.replace(_TOKEN, "[REDACTED]") if _TOKEN else value
+    if isinstance(value, dict):
+        return {redact(k): redact(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [redact(v) for v in value]
+    return value
+
+
+def contains_token(value):
+    if isinstance(value, str):
+        return _TOKEN in value
+    if isinstance(value, dict):
+        return any(contains_token(k) or contains_token(v) for k, v in value.items())
+    if isinstance(value, list):
+        return any(contains_token(v) for v in value)
+    return False
+
+
+def emit(value, stream=None):
+    print(json.dumps(redact(value), ensure_ascii=False), file=stream or sys.stdout)
+
+
+def valid_id(value, task=False):
+    value = str(value)
+    pattern = r"(?:[A-Za-z0-9]+|[A-Z]+-[0-9]+)" if task else r"[0-9]+"
+    if not re.fullmatch(pattern, value):
+        raise CLIError("invalid ID")
+    return value
+
+
+def validate_args(args):
+    for key, value in vars(args).items():
+        if value is None:
+            continue
+        if key in ("task_id", "parent", "depends_on"):
+            valid_id(value, task=True)
+        elif key in ("list_id", "space_id", "folder_id", "team", "space", "folder", "assignee", "start_id"):
+            valid_id(value)
+        elif key in ("assignees", "remove_assignees", "space_ids", "folder_ids", "list_ids"):
+            for item in value.split(","):
+                valid_id(item.strip())
+        elif (key == "page" or (key == "start" and args.command == "comment")) and value < 0:
+            raise CLIError("page and comment start must be nonnegative")
+        elif key == "priority" and value not in (1, 2, 3, 4):
+            raise CLIError("priority must be 1 through 4")
+    if args.command == "comment" and args.sub == "list":
+        if (args.start is None) != (args.start_id is None):
+            raise CLIError("provide --start and --start-id together")
+
 
 def resolve_team(explicit=None):
-    """Resolve the workspace (team) ID: an explicit --team wins, then
-    $CLICKUP_TEAM_ID, then a live lookup of the workspaces this token can reach.
-    The lookup only decides when the token sees exactly one workspace; with
-    several we list them and stop rather than guess which one was meant."""
+    """Resolve explicit workspace, environment, or an unambiguous API result."""
     global _TEAM_ID
     if explicit:
-        return explicit
+        return valid_id(explicit)
     if _TEAM_ID:
         return _TEAM_ID
-    env = os.environ.get("CLICKUP_TEAM_ID", "").strip()
+    env = os.environ.get("CLICKUP_TEAM_ID", "")
     if env:
-        _TEAM_ID = env
-        return _TEAM_ID
-    teams = api("/team").get("teams", [])
-    if len(teams) == 1:
-        _TEAM_ID = teams[0]["id"]
-        return _TEAM_ID
-    if not teams:
-        print("Error: this token has access to no workspace", file=sys.stderr)
+        _TEAM_ID = valid_id(env)
     else:
-        opts = "\n".join(f"  {t['id']}  {t.get('name','?')}" for t in teams)
-        print("Error: token has access to several workspaces. Set CLICKUP_TEAM_ID "
-              f"(or pass --team where the command accepts it):\n{opts}", file=sys.stderr)
-    sys.exit(1)
+        teams = api("/team").get("teams", [])
+        if len(teams) != 1:
+            raise CLIError("set CLICKUP_TEAM_ID or --team: workspace lookup is not unambiguous")
+        _TEAM_ID = valid_id(teams[0]["id"])
+    return _TEAM_ID
+
 
 def api(path, method="GET", data=None, params=None, array_params=None):
-    """Make API request.
-    array_params: list of keys that should be repeated (e.g. ?statuses[]=open&statuses[]=in%20progress)
-    """
-    token = os.environ.get("CLICKUP_API_KEY", "")
-    if not token:
-        print("Error: CLICKUP_API_KEY not set", file=sys.stderr)
-        sys.exit(1)
-
-    url = f"{API_BASE}{path}"
-    if params:
-        parts = []
-        for k, v in params.items():
-            if array_params and k in array_params:
-                for item in v.split(","):
-                    if item.strip():
-                        parts.append(f"{k}[]={urllib.parse.quote(item.strip())}")
-            else:
-                parts.append(f"{k}={urllib.parse.quote(str(v))}")
-        if parts:
-            url += "?" + "&".join(parts)
-
+    """Send credentials only in Authorization, over verified HTTPS, without proxies/redirects."""
+    if method != "GET" and not _WRITE_ALLOWED:
+        raise CLIError("write request requires an explicit write command")
+    if not _TOKEN:
+        raise CLIError("missing credential")
+    if (API_BASE != "https://api.clickup.com/api/v2" or not path.startswith("/")
+            or path.startswith("//") or any(c in path for c in "?#\\\r\n")
+            or any(part in (".", "..") for part in path.split("/"))):
+        raise CLIError("invalid API destination")
+    pairs = []
+    for key, value in (params or {}).items():
+        if key in (array_params or []):
+            pairs.extend((key + "[]", item.strip()) for item in value.split(",") if item.strip())
+        else:
+            pairs.append((key, str(value)))
+    url = API_BASE + path
+    if pairs:
+        url += "?" + urllib.parse.urlencode(pairs)
+    text = json.dumps(data, ensure_ascii=False) if data is not None else ""
+    # Also reject accidental copy/paste of the active token into content/filters.
+    if _TOKEN in urllib.parse.unquote(url) or contains_token(data):
+        raise CLIError("credential is not allowed in request URL or body")
     req = urllib.request.Request(url, method=method)
-    req.add_header("Authorization", token)
-    if data is not None:
+    req.add_header("Authorization", _TOKEN)
+    body = text.encode("utf-8") if data is not None else None
+    if body is not None:
         req.add_header("Content-Type", "application/json")
-        body = json.dumps(data).encode()
-    else:
-        body = None
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}), NoRedirect(),
+        urllib.request.HTTPSHandler(context=ssl.create_default_context()))
+    try:
+        with opener.open(req, data=body, timeout=REQUEST_TIMEOUT) as resp:
+            raw = resp.read(MAX_RESPONSE_BYTES + 1)
+        if len(raw) > MAX_RESPONSE_BYTES:
+            raise CLIError("API response exceeds size limit", 6)
+        result = json.loads(raw.decode("utf-8")) if raw else {}
+        if not isinstance(result, dict):
+            raise CLIError("API returned an unexpected JSON shape", 6)
+        return result
+    except urllib.error.HTTPError as exc:
+        # Never read/print response bodies, URLs, reason phrases or exception text.
+        status = exc.code
+        retry = exc.headers.get("Retry-After", "") if exc.headers else ""
+        exc.close()
+        if status == 429:
+            details = {"http_status": status}
+            if re.fullmatch(r"[0-9]{1,9}", retry) and _TOKEN not in retry:
+                details["retry_after"] = retry
+            raise CLIError("rate limited; retry only after waiting", 4, **details) from None
+        raise CLIError("redirect refused" if 300 <= status < 400 else "HTTP request failed",
+                       3, http_status=status) from None
+    except (urllib.error.URLError, OSError, TimeoutError):
+        raise CLIError("network or TLS request failed", 5) from None
+    except (ValueError, UnicodeError):
+        raise CLIError("API returned invalid JSON", 6) from None
 
-    delay = RETRY_DELAY
-    for attempt in range(MAX_RETRIES):
-        try:
-            with urllib.request.urlopen(req, data=body, timeout=30) as resp:
-                raw = resp.read().decode()
-                return json.loads(raw) if raw else {}
-        except urllib.error.HTTPError as e:
-            if e.code == 429 and attempt < MAX_RETRIES - 1:
-                time.sleep(delay)
-                delay *= 2
-                continue
-            err = e.read().decode()
-            try:
-                detail = json.loads(err)
-            except json.JSONDecodeError:
-                detail = {"raw": err}
-            print(f"HTTP {e.code}: {detail}", file=sys.stderr)
-            sys.exit(1)
 
 def date_to_epoch(d):
-    """Convert YYYY-MM-DD to epoch ms."""
-    dt = datetime.strptime(d, "%Y-%m-%d")
-    return int(dt.replace(tzinfo=timezone.utc).timestamp() * 1000)
+    return int(datetime.strptime(d, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp() * 1000)
 
-def dt_to_epoch(dt_str):
-    """Convert YYYY-MM-DD HH:MM to epoch ms."""
-    dt = datetime.strptime(dt_str, "%Y-%m-%d %H:%M")
-    return int(dt.replace(tzinfo=timezone.utc).timestamp() * 1000)
 
-def parse_duration(dur_str):
-    """Parse '1h 30m' or '90m' to minutes."""
-    total = 0
-    m = re.search(r"(\d+)h", dur_str)
-    if m:
-        total += int(m.group(1)) * 60
-    m = re.search(r"(\d+)m", dur_str)
-    if m:
-        total += int(m.group(1))
-    return total * 60 * 1000  # epoch ms
+def dt_to_epoch(d):
+    return int(datetime.strptime(d, "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc).timestamp() * 1000)
+
+
+def parse_duration(value):
+    if not re.fullmatch(r"(?:[0-9]+h(?:\s+[0-9]+m)?|[0-9]+m)", value):
+        raise CLIError("duration must be hours/minutes, for example 1h 30m")
+    hours = re.search(r"([0-9]+)h", value)
+    minutes = re.search(r"([0-9]+)m", value)
+    return ((int(hours[1]) * 60 if hours else 0) + (int(minutes[1]) if minutes else 0)) * 60000
+
 
 def _is_custom_id(task_id):
-    """Check if task_id matches custom ID format (e.g. ABC-12345)."""
-    return bool(re.search(r'^[A-Z]+-\d+$', task_id))
+    return bool(re.fullmatch(r"[A-Z]+-[0-9]+", task_id))
+
 
 def _custom_task_params(task_id):
-    """Return custom_task_ids=true + team_id params when task_id is a custom ID."""
-    if _is_custom_id(task_id):
-        return {"custom_task_ids": "true", "team_id": resolve_team()}
-    return {}
+    valid_id(task_id, task=True)
+    return {"custom_task_ids": "true", "team_id": resolve_team()} if _is_custom_id(task_id) else {}
+
+
+def task_pages(path, params, arrays, page=None):
+    tasks, seen = [], set()
+    current = page if page is not None else 0
+    for count in range(1, MAX_PAGES + 1):
+        res = api(path, params={**params, "page": current}, array_params=arrays)
+        batch = res.get("tasks")
+        if not isinstance(batch, list):
+            raise CLIError("API returned invalid task page", 6)
+        complete = not batch or res.get("last_page") is True
+        ids = [str(t["id"]) for t in batch]
+        if batch and all(tid in seen for tid in ids):
+            raise CLIError("task pagination did not advance; no partial output returned", 6)
+        for task in batch:
+            tid = str(task["id"])
+            if tid not in seen:
+                tasks.append(task)
+                seen.add(tid)
+        if complete or page is not None:
+            return {"tasks": tasks, "pages": count, "page": current,
+                    "complete": complete, "next_page": None if complete else current + 1}
+        current += 1
+    raise CLIError("task pagination limit exceeded; no partial output returned", 6)
+
 
 # ─── Tasks ────────────────────────────────────────────────────────────────
 
 def cmd_task(args):
     sub = args.sub
     if sub == "get":
-        res = api(f"/task/{args.task_id}", params=_custom_task_params(args.task_id))
-        t = res
-        print(f"ID: {t['id']}")
-        custom_id = t.get("custom_id")
-        if custom_id:
-            print(f"Custom ID: {custom_id}")
-        print(f"Name: {t['name']}")
-        print(f"Status: {t['status']['status']}")
-        p = t.get("priority") or {}
-        print(f"Priority: {p.get('priority', 'none')}")
-        due = t.get("due_date")
-        if due:
-            print(f"Due: {datetime.fromtimestamp(int(due)/1000, tz=timezone.utc).strftime('%Y-%m-%d')}")
-        print(f"Creator: {t.get('creator',{}).get('username','?')}")
-        print(f"Assignees: {', '.join(a['username'] for a in t.get('assignees',[]))}")
-        print(f"Tags: {', '.join(g['name'] for g in t.get('tags',[]))}")
-        print(f"List: {t.get('list',{}).get('name','?')} (id: {t.get('list',{}).get('id','?')})")
-        print(f"Folder: {t.get('folder',{}).get('name','?')} (id: {t.get('folder',{}).get('id','?')})")
-        print(f"Space ID: {t.get('space',{}).get('id','?')}")
-        if t.get("parent"):
-            print(f"Parent: {t['parent']}")
-        print(f"URL: https://app.clickup.com/t/{t['id']}")
-        desc = t.get("description", "")
-        if desc:
-            print(f"\nDescription:\n{desc}")
-
-    elif sub == "create":
-        list_id = args.list_id
-        parent_id = args.parent
-        # POST /list/{id}/task does not resolve custom IDs in the `parent` body
-        # field, so a custom parent must be turned into its native ID first.
-        # The same lookup yields the parent's list when none was given.
-        if args.parent and (not list_id or _is_custom_id(args.parent)):
-            parent = api(f"/task/{args.parent}", params=_custom_task_params(args.parent))
-            parent_id = parent.get("id", args.parent)
-            if not list_id:
-                list_id = parent.get("list", {}).get("id")
-                if not list_id:
-                    print(f"Error: could not resolve list from parent task {args.parent}", file=sys.stderr)
-                    sys.exit(1)
-                print(f"(list_id {list_id} inherited from parent {args.parent})")
-        if not list_id:
-            print("Error: provide <list_id>, or --parent to inherit the parent task's list", file=sys.stderr)
-            sys.exit(1)
-        payload = {"name": args.name}
-        if args.description:
-            payload["description"] = args.description
-        if args.markdown:
+        return api(f"/task/{args.task_id}", params=_custom_task_params(args.task_id))
+    if sub in ("list", "search"):
+        params = {}
+        arrays = ["statuses", "assignees", "space_ids", "project_ids", "list_ids"]
+        for key in ("statuses", "assignees", "space_ids", "folder_ids", "list_ids"):
+            value = getattr(args, key, None)
+            if value:
+                params["project_ids" if key == "folder_ids" else key] = value
+        if args.include_closed:
+            params["include_closed"] = "true"
+        for key in ("due_date_gt", "due_date_lt"):
+            if getattr(args, key, None):
+                params[key] = date_to_epoch(getattr(args, key))
+        path = f"/list/{args.list_id}/task" if sub == "list" else f"/team/{resolve_team(args.team)}/task"
+        return task_pages(path, params, arrays, args.page)
+    if sub in ("create", "update"):
+        payload = {}
+        for key in ("name", "description", "status", "priority"):
+            if getattr(args, key, None) is not None:
+                payload[key] = getattr(args, key)
+        if args.markdown is not None:
+            payload.pop("description", None)
             payload["markdown_content"] = args.markdown
-        if args.assignees:
-            payload["assignees"] = [int(x) for x in args.assignees.split(",")]
-        if args.priority is not None:
-            payload["priority"] = int(args.priority)
         if args.due_date:
             payload["due_date"] = date_to_epoch(args.due_date)
-        if args.tags:
-            payload["tags"] = args.tags.split(",")
-        if args.status:
-            payload["status"] = args.status
+        if args.assignees:
+            ids = [int(x) for x in args.assignees.split(",")]
+            payload["assignees"] = ids if sub == "create" else {"add": ids}
+        if sub == "update":
+            if args.remove_assignees:
+                payload.setdefault("assignees", {})["rem"] = [int(x) for x in args.remove_assignees.split(",")]
+            if not payload:
+                return {"updated": False, "reason": "nothing to update"}
+            return api(f"/task/{args.task_id}", "PUT", payload, _custom_task_params(args.task_id))
+        list_id, parent_id = args.list_id, args.parent
+        if parent_id and (not list_id or _is_custom_id(parent_id)):
+            parent = api(f"/task/{parent_id}", params=_custom_task_params(parent_id))
+            parent_id = valid_id(parent["id"], task=True)
+            list_id = list_id or parent.get("list", {}).get("id")
+        if not list_id:
+            raise CLIError("provide list_id or a parent with a list")
         if parent_id:
             payload["parent"] = parent_id
-        res = api(f"/list/{list_id}/task", method="POST", data=payload)
-        print(f"Created: {res.get('id')} — {res.get('name')}")
+        if args.tags:
+            payload["tags"] = args.tags.split(",")
+        return api(f"/list/{valid_id(list_id)}/task", "POST", payload)
+    if sub == "delete":
+        return api(f"/task/{args.task_id}", "DELETE", params=_custom_task_params(args.task_id))
+    if sub == "move":
+        return api(f"/list/{args.list_id}/task/{args.task_id}", "POST", params=_custom_task_params(args.task_id))
 
-    elif sub == "update":
-        payload = {}
-        if args.name:
-            payload["name"] = args.name
-        if args.markdown:
-            payload["markdown_content"] = args.markdown
-        elif args.description:
-            payload["description"] = args.description
-        if args.status:
-            payload["status"] = args.status
-        if args.priority is not None:
-            payload["priority"] = int(args.priority)
-        if args.due_date:
-            payload["due_date"] = date_to_epoch(args.due_date)
-        if args.assignees:
-            # PUT /task requires the add/rem object shape; a flat list is
-            # silently ignored (unlike POST create, which takes a flat array).
-            payload["assignees"] = {"add": [int(x) for x in args.assignees.split(",")]}
-        if not payload:
-            print("Nothing to update")
-            return
-        res = api(f"/task/{args.task_id}", method="PUT", data=payload, params=_custom_task_params(args.task_id))
-        print(f"Updated: {res.get('id')}")
-
-    elif sub == "delete":
-        api(f"/task/{args.task_id}", method="DELETE", params=_custom_task_params(args.task_id))
-        print(f"Deleted: {args.task_id}")
-
-    elif sub == "list":
-        params = {}
-        if args.statuses:
-            params["statuses"] = args.statuses
-        if args.include_closed:
-            params["include_closed"] = "true"
-        if args.page is not None:
-            params["page"] = str(args.page)
-        res = api(f"/list/{args.list_id}/task", params=params, array_params=["statuses"])
-        tasks = res.get("tasks", [])
-        print(f"Tasks ({len(tasks)}):")
-        for t in tasks:
-            due = ""
-            if t.get("due_date"):
-                due = f" due:{datetime.fromtimestamp(int(t['due_date'])/1000).strftime('%m-%d')}"
-            print(f"  {t['id']} [{t['status']['status']}]{due} — {t['name'][:80]}")
-
-    elif sub == "search":
-        team_id = resolve_team(args.team)
-        params = {"team_id": team_id}
-        if args.statuses:
-            params["statuses"] = args.statuses
-        if args.assignees:
-            params["assignees"] = args.assignees
-        if args.include_closed:
-            params["include_closed"] = "true"
-        if args.space_ids:
-            params["space_ids"] = args.space_ids
-        if args.folder_ids:
-            params["project_ids"] = args.folder_ids
-        if args.list_ids:
-            params["list_ids"] = args.list_ids
-        if args.due_date_gt:
-            params["due_date_gt"] = str(date_to_epoch(args.due_date_gt))
-        if args.due_date_lt:
-            params["due_date_lt"] = str(date_to_epoch(args.due_date_lt))
-        if args.page is not None:
-            params["page"] = str(args.page)
-        res = api(f"/team/{team_id}/task", params=params, array_params=["statuses", "assignees", "space_ids", "project_ids", "list_ids"])
-        tasks = res.get("tasks", [])
-        print(f"Tasks ({len(tasks)}):")
-        for t in tasks:
-            due = ""
-            if t.get("due_date"):
-                due = f" due:{datetime.fromtimestamp(int(t['due_date'])/1000).strftime('%m-%d')}"
-            print(f"  {t['id']} [{t['status']['status']}]{due} — {t['name'][:80]}")
-
-    elif sub == "move":
-        api(f"/list/{args.list_id}/task/{args.task_id}", method="POST", params=_custom_task_params(args.task_id))
-        print(f"Moved {args.task_id} to list {args.list_id}")
 
 # ─── Comments ─────────────────────────────────────────────────────────────
 
 def _resolve_mentions(tokens):
-    """Resolve --mention tokens (numeric user IDs, names, or emails) into
-    [{"id", "username"}] by scanning workspace members. Fails loud: an unmatched
-    or ambiguous name/email aborts rather than silently dropping the mention
-    (a dropped mention = a person who never gets notified)."""
-    members = []  # (id, username, email)
-    for t in api("/team").get("teams", []):
-        for m in t.get("members", []):
-            u = m.get("user", {})
-            if u.get("id") is not None:
-                members.append((u["id"], u.get("username") or "", u.get("email") or ""))
-    by_id = {mid: (name, email) for mid, name, email in members}
-
-    resolved, errors = [], []
-    for raw in [t.strip() for t in tokens if t.strip()]:
-        if raw.isdigit():
+    members = {}
+    for team in api("/team").get("teams", []):
+        for member in team.get("members", []):
+            user = member.get("user", {})
+            if user.get("id") is not None:
+                members[int(valid_id(user["id"]))] = user
+    resolved = []
+    for raw in tokens:
+        raw = raw.strip()
+        if re.fullmatch(r"[0-9]+", raw):
             uid = int(raw)
-            # An ID outside the member list (e.g. a guest) is trusted as-is:
-            # the mention still notifies through the id.
-            resolved.append({"id": uid, "username": by_id.get(uid, ("", ""))[0]})
-            continue
-        q = raw.lower()
-        hits = {mid: name for mid, name, email in members
-                if q == email.lower() or q == name.lower() or q in name.lower() or q in email.lower()}
-        if len(hits) == 1:
-            mid = next(iter(hits))
-            resolved.append({"id": mid, "username": hits[mid]})
-        elif not hits:
-            errors.append(f"no workspace member matches '{raw}'")
         else:
-            opts = ", ".join(f"{n} ({i})" for i, n in hits.items())
-            errors.append(f"'{raw}' is ambiguous — matches: {opts}. Use a numeric ID.")
-    if errors:
-        print("Error resolving --mention:\n  - " + "\n  - ".join(errors), file=sys.stderr)
-        sys.exit(1)
+            query = raw.lower()
+            hits = [uid for uid, user in members.items() if query and
+                    (query in (user.get("username") or "").lower() or
+                     query in (user.get("email") or "").lower())]
+            if len(hits) != 1:
+                raise CLIError("mention is unmatched or ambiguous; use a numeric user ID")
+            uid = hits[0]
+        resolved.append({"id": uid, "username": members.get(uid, {}).get("username") or ""})
     return resolved
 
-def cmd_comment(args):
-    if args.sub == "list":
-        res = api(f"/task/{args.task_id}/comment", params=_custom_task_params(args.task_id))
-        for c in res.get("comments", []):
-            u = c.get("user", {})
-            date = datetime.fromtimestamp(int(c["date"])/1000).strftime("%Y-%m-%d %H:%M")
-            print(f"[{date}] {u.get('username','?')}: {c.get('comment_text','')}")
-    elif args.sub == "add":
-        mentions = _resolve_mentions(args.mention.split(",")) if args.mention else []
-        if mentions:
-            # ClickUp only creates a real @mention through the structured
-            # `comment` array; plain `comment_text` is stored as literal text and
-            # notifies nobody. Each mention becomes a {type: tag, user: {id}}
-            # fragment — the display label is cosmetic, user.id drives the notify.
-            fragments = [{"text": "@" + (m["username"] or ""), "type": "tag", "user": {"id": m["id"]}}
-                         for m in mentions]
-            fragments.append({"text": (" " + args.text) if args.text else ""})
-            data = {"comment": fragments}
-        else:
-            data = {"comment_text": args.text}
-        if args.notify_all:
-            data["notify_all"] = True
-        res = api(f"/task/{args.task_id}/comment", method="POST", data=data, params=_custom_task_params(args.task_id))
-        print(f"Comment added: {res.get('id')}")
 
-# ─── Hierarchy ────────────────────────────────────────────────────────────
+def cmd_comment(args):
+    path = f"/task/{args.task_id}/comment"
+    params = _custom_task_params(args.task_id)
+    if args.sub == "list":
+        comments, seen = [], set()
+        cursor = (str(args.start), str(args.start_id)) if args.start is not None else None
+        cursors = {cursor} if cursor else set()
+        for count in range(1, MAX_PAGES + 1):
+            if cursor:
+                params.update(start=cursor[0], start_id=cursor[1])
+            res = api(path, params=params)
+            batch = res.get("comments")
+            if not isinstance(batch, list):
+                raise CLIError("API returned invalid comment page", 6)
+            if not batch:
+                return {"comments": comments, "pages": count, "complete": True, "next_cursor": None}
+            for comment in batch:
+                cid = valid_id(comment["id"])
+                if cid not in seen:
+                    comments.append(comment)
+                    seen.add(cid)
+            last = batch[-1]
+            cursor = (valid_id(last["date"]), valid_id(last["id"]))
+            if cursor in cursors:
+                raise CLIError("comment pagination did not advance; no partial output returned", 6)
+            cursors.add(cursor)
+            if args.single_page:
+                return {"comments": comments, "pages": count, "complete": False,
+                        "next_cursor": {"start": cursor[0], "start_id": cursor[1]}}
+        raise CLIError("comment pagination limit exceeded; no partial output returned", 6)
+    mentions = _resolve_mentions(args.mention.split(",")) if args.mention else []
+    if mentions:
+        fragments = [{"text": "@" + m["username"], "type": "tag", "user": {"id": m["id"]}} for m in mentions]
+        fragments.append({"text": " " + args.text})
+        data = {"comment": fragments}
+    else:
+        data = {"comment_text": args.text}
+    if args.notify_all:
+        data["notify_all"] = True
+    return api(path, "POST", data, params)
+
+
+# ─── Hierarchy, users, tags, dependencies, time ─────────────────────────────
 
 def cmd_hierarchy(args):
     if args.space:
-        res = api(f"/space/{args.space}?include_lists=true")
-        print(f"Space: {res['name']} ({res['id']})")
-        for f in res.get("folders", []):
-            print(f"  └ Folder: {f['name']} ({f['id']})")
-            for l in f.get("lists", []):
-                print(f"      └ List: {l['name']} ({l['id']})")
-        for l in res.get("lists", []):
-            print(f"  └ (root) List: {l['name']} ({l['id']})")
-    else:
-        res = api(f"/team/{resolve_team(args.team)}/space")
-        for s in res.get("spaces", []):
-            print(f"Space: {s['name']} ({s['id']})")
+        return api(f"/space/{args.space}", params={"include_lists": "true"})
+    return api(f"/team/{resolve_team(args.team)}/space")
+
 
 def cmd_space(args):
-    res = api(f"/space/{args.space_id}")
-    print(f"ID: {res['id']}\nName: {res['name']}")
+    return api(f"/space/{args.space_id}")
+
 
 def cmd_folder(args):
-    res = api(f"/folder/{args.folder_id}")
-    print(f"Folder: {res['name']} ({res['id']})")
-    for l in res.get("lists", []):
-        print(f"  List: {l['name']} ({l['id']})")
+    return api(f"/folder/{args.folder_id}")
+
 
 def cmd_list(args):
-    if args.sub == "find":
-        q = args.name.lower()
-        tid = resolve_team(args.team)
-        matches = []
-        for sp in api(f"/team/{tid}/space").get("spaces", []):
-            sid, sname = sp["id"], sp["name"]
-            for f in api(f"/space/{sid}/folder").get("folders", []):
-                for l in f.get("lists", []):
-                    if q in l["name"].lower():
-                        matches.append((l["id"], l["name"], f"{sname} > {f['name']}"))
-            for l in api(f"/space/{sid}/list").get("lists", []):
-                if q in l["name"].lower():
-                    matches.append((l["id"], l["name"], sname))
-        if not matches:
-            print(f"No lists matching '{args.name}'")
-            sys.exit(1)
-        for lid, lname, path in matches:
-            print(f"{lid} — {lname}  [{path}]")
-    elif args.sub == "get":
-        res = api(f"/list/{args.list_id}")
-        print(f"ID: {res['id']}\nName: {res['name']}\nContent: {res.get('content','')}")
-    elif args.sub == "create":
+    if args.sub == "get":
+        return api(f"/list/{args.list_id}")
+    if args.sub == "fields":
+        return api(f"/list/{args.list_id}/field")
+    if args.sub == "create":
         data = {"name": args.name}
-        if args.content:
+        if args.content is not None:
             data["content"] = args.content
-        if args.folder:
-            res = api(f"/folder/{args.folder}/list", method="POST", data=data)
-        else:
-            res = api(f"/space/{args.space_id}/list", method="POST", data=data)
-        print(f"Created list: {res.get('id')} — {res.get('name')}")
-    elif args.sub == "fields":
-        res = api(f"/list/{args.list_id}/field")
-        for f in res.get("fields", []):
-            print(f"  {f['name']} ({f['id']}) type={f['type']}")
+        path = f"/folder/{args.folder}/list" if args.folder else f"/space/{args.space_id}/list"
+        return api(path, "POST", data)
+    matches = []
+    for space in api(f"/team/{resolve_team(args.team)}/space").get("spaces", []):
+        sid = valid_id(space["id"])
+        lists = api(f"/space/{sid}/list").get("lists", [])
+        for folder in api(f"/space/{sid}/folder").get("folders", []):
+            lists.extend(folder.get("lists", []))
+        matches.extend(item for item in lists if args.name.lower() in item["name"].lower())
+    return {"lists": matches}
 
-# ─── User ─────────────────────────────────────────────────────────────────
 
 def cmd_user(args):
     if args.sub == "info":
-        res = api("/user")
-        u = res["user"]
-        print(f"ID: {u['id']}\nName: {u['username']}\nEmail: {u['email']}")
-    elif args.sub == "find":
-        res = api("/team")
-        q = args.name_or_email.lower()
-        found = []
-        for t in res.get("teams", []):
-            for m in t.get("members", []):
-                u = m.get("user", {})
-                name = u.get("username") or ""
-                email = u.get("email") or ""
-                if q in name.lower() or q in email.lower():
-                    found.append((t["name"], u["id"], u["username"], u.get("email", "")))
-        for team, uid, name, email in found:
-            print(f"  [{team}] {name} ({email}) — ID: {uid}")
+        return api("/user")
+    query = args.name_or_email.lower()
+    matches = []
+    for team in api("/team").get("teams", []):
+        for member in team.get("members", []):
+            user = member.get("user", {})
+            if query in (user.get("username") or "").lower() or query in (user.get("email") or "").lower():
+                matches.append({"team_id": team["id"], "user": user})
+    return {"users": matches}
 
-# ─── Workspace ────────────────────────────────────────────────────────────
 
 def cmd_workspace(args):
     tid = resolve_team(args.team)
-    if args.sub == "members":
-        res = api("/team")
-        for t in res.get("teams", []):
-            if str(t["id"]) == str(tid):
-                for m in t.get("members", []):
-                    u = m.get("user", {})
-                    print(f"  {u.get('id')}: {u.get('username','?')} ({u.get('email','?')})")
-    elif args.sub == "spaces":
-        res = api(f"/team/{tid}/space")
-        for s in res.get("spaces", []):
-            print(f"  {s['id']}: {s['name']}")
+    if args.sub == "spaces":
+        return api(f"/team/{tid}/space")
+    for team in api("/team").get("teams", []):
+        if str(team["id"]) == tid:
+            return {"members": team.get("members", [])}
+    return {"members": []}
 
-# ─── Tags ─────────────────────────────────────────────────────────────────
 
 def cmd_tag(args):
-    if args.sub == "add":
-        api(f"/task/{args.task_id}/tag/{args.tag_name}", method="POST", params=_custom_task_params(args.task_id))
-        print(f"Tag '{args.tag_name}' added to {args.task_id}")
-    elif args.sub == "remove":
-        api(f"/task/{args.task_id}/tag/{args.tag_name}", method="DELETE", params=_custom_task_params(args.task_id))
-        print(f"Tag '{args.tag_name}' removed from {args.task_id}")
+    tag = urllib.parse.quote(args.tag_name, safe="")
+    return api(f"/task/{args.task_id}/tag/{tag}", "POST" if args.sub == "add" else "DELETE",
+               params=_custom_task_params(args.task_id))
 
-# ─── Dependencies ─────────────────────────────────────────────────────────
 
 def cmd_dependency(args):
-    t = args.type or "waiting_on"
+    key = "depends_on" if args.type != "blocking" else "dependency_of"
+    data = {key: args.depends_on}
+    params = _custom_task_params(args.task_id)
     if args.sub == "add":
-        data = {"depends_on": args.depends_on} if t == "waiting_on" else {"dependency_of": args.depends_on}
-        api(f"/task/{args.task_id}/dependency", method="POST", data=data, params=_custom_task_params(args.task_id))
-        print(f"Dependency added: {args.task_id} {t} {args.depends_on}")
-    elif args.sub == "remove":
-        params = {"depends_on": args.depends_on}
-        params.update(_custom_task_params(args.task_id))
-        api(f"/task/{args.task_id}/dependency", method="DELETE", params=params)
-        print(f"Dependency removed")
+        return api(f"/task/{args.task_id}/dependency", "POST", data, params)
+    return api(f"/task/{args.task_id}/dependency", "DELETE", params={**params, **data})
 
-# ─── Time Tracking ────────────────────────────────────────────────────────
 
 def cmd_time(args):
     tid = resolve_team(args.team)
+    path = f"/team/{tid}/time_entries"
     if args.sub == "status":
-        res = api(f"/team/{tid}/time_entries/current")
-        if res.get("data"):
-            e = res["data"]
-            print(f"Running on task {e.get('task',{}).get('id','?')}: {e.get('description','')}")
-        else:
-            print("No timer running")
-    elif args.sub == "start":
-        data = {"task_id": args.task_id}
-        if args.description:
-            data["description"] = args.description
-        if args.billable:
-            data["billable"] = True
-        res = api(f"/team/{tid}/time_entries/start", method="POST", data=data)
-        print(f"Timer started on {args.task_id}")
-    elif args.sub == "stop":
+        return api(path + "/current")
+    if args.sub in ("start", "stop"):
         data = {}
-        if args.description:
+        if args.sub == "start":
+            data["task_id"] = args.task_id
+            if args.billable:
+                data["billable"] = True
+        if args.description is not None:
             data["description"] = args.description
-        res = api(f"/team/{tid}/time_entries/stop", method="POST", data=data)
-        print("Timer stopped")
-    elif args.sub == "add":
-        start_ms = dt_to_epoch(args.start)
-        data = {"task_id": args.task_id, "start": str(start_ms)}
-        if args.duration:
-            data["duration"] = str(parse_duration(args.duration))
-        elif args.end:
-            end_ms = dt_to_epoch(args.end)
-            data["end"] = str(end_ms)
-            data["duration"] = str(end_ms - start_ms)
-        api(f"/team/{tid}/time_entries", method="POST", data=data)
-        print(f"Time entry added to {args.task_id}")
-    elif args.sub == "entries":
-        res = api(f"/task/{args.task_id}/time_entries", params=_custom_task_params(args.task_id))
-        for e in res.get("data", []):
-            dur = int(e.get("duration", 0)) // 1000
-            h, m = dur // 3600, (dur % 3600) // 60
-            desc = e.get("description", "") or ""
-            print(f"  {h}h {m:02d}m — {desc}")
-    elif args.sub == "report":
-        from_ms = date_to_epoch(args.from_date)
-        to_ms = date_to_epoch(args.to_date)
-        params = {"start_date": str(from_ms), "end_date": str(to_ms)}
+        return api(path + "/" + args.sub, "POST", data)
+    if args.sub == "entries":
+        return api(f"/task/{args.task_id}/time_entries", params=_custom_task_params(args.task_id))
+    if args.sub == "report":
+        params = {"start_date": date_to_epoch(args.from_date), "end_date": date_to_epoch(args.to_date)}
         if args.assignee:
             params["assignee"] = args.assignee
-        res = api(f"/team/{tid}/time_entries", params=params)
-        total = 0
-        for e in res.get("data", []):
-            dur = int(e.get("duration", 0)) // 1000
-            h, m = dur // 3600, (dur % 3600) // 60
-            desc = e.get("description", "") or ""
-            uid = e.get("user", {}).get("id", "?")
-            print(f"  [{uid}] {h}h {m:02d}m — {desc}")
-            total += dur
-        th, tm = total // 3600, (total % 3600) // 60
-        print(f"\nTotal: {th}h {tm:02d}m")
+        return api(path, params=params)
+    start = dt_to_epoch(args.start)
+    data = {"task_id": args.task_id, "start": str(start)}
+    if args.duration:
+        duration = parse_duration(args.duration)
+    elif args.end:
+        duration = dt_to_epoch(args.end) - start
+        data["end"] = str(dt_to_epoch(args.end))
+    else:
+        raise CLIError("provide --duration or --end")
+    if duration <= 0:
+        raise CLIError("duration must be positive")
+    data["duration"] = str(duration)
+    return api(path, "POST", data)
 
-# ─── Custom Fields ────────────────────────────────────────────────────────
 
 def cmd_custom_fields(args):
-    res = api(f"/list/{args.list_id}/field")
-    for f in res.get("fields", []):
-        print(f"  {f['name']} ({f['id']})")
-        print(f"    Type: {f['type']}")
-        if f.get("type_config", {}).get("options"):
-            for o in f["type_config"]["options"]:
-                print(f"    Option: {o.get('name','')} = {o.get('orderindex','')}")
+    return api(f"/list/{args.list_id}/field")
+
 
 # ─── Main ─────────────────────────────────────────────────────────────────
 
-def main():
+def _main():
 
-    parser = argparse.ArgumentParser(description="ClickUp CLI")
+    parser = SafeParser(description="ClickUp CLI — JSON output; credentials never accepted as argv values", allow_abbrev=False)
+    parser.add_argument("--token-file", help="Private credential file; place before command")
     sub = parser.add_subparsers(dest="command", required=True)
 
     # task
@@ -598,11 +513,11 @@ def main():
     tu.add_argument("task_id"); tu.add_argument("--name"); tu.add_argument("--description")
     tu.add_argument("--markdown")
     tu.add_argument("--status"); tu.add_argument("--priority", type=int); tu.add_argument("--due-date")
-    tu.add_argument("--assignees")
+    tu.add_argument("--assignees"); tu.add_argument("--remove-assignees")
     tsp.add_parser("delete").add_argument("task_id")
     tl = tsp.add_parser("list")
     tl.add_argument("list_id"); tl.add_argument("--statuses"); tl.add_argument("--include-closed", action="store_true")
-    tl.add_argument("--page", type=int)
+    tl.add_argument("--page", type=int); tl.add_argument("--assignees")
     ts = tsp.add_parser("search")
     ts.add_argument("--team"); ts.add_argument("--assignees")
     ts.add_argument("--statuses"); ts.add_argument("--include-closed", action="store_true")
@@ -615,7 +530,9 @@ def main():
     # comment
     cp = sub.add_parser("comment")
     csp = cp.add_subparsers(dest="sub", required=True)
-    csp.add_parser("list").add_argument("task_id")
+    cl = csp.add_parser("list")
+    cl.add_argument("task_id"); cl.add_argument("--start", type=int); cl.add_argument("--start-id")
+    cl.add_argument("--single-page", action="store_true")
     ca = csp.add_parser("add")
     ca.add_argument("task_id"); ca.add_argument("text"); ca.add_argument("--notify-all", action="store_true")
     ca.add_argument("--mention", help="Comma-separated user IDs, names, or emails to @mention (real, notifying mention; ambiguous names abort)")
@@ -658,8 +575,8 @@ def main():
     # dependency
     dp = sub.add_parser("dependency")
     dsp = dp.add_subparsers(dest="sub", required=True)
-    da = dsp.add_parser("add"); da.add_argument("task_id"); da.add_argument("--depends-on", required=True); da.add_argument("--type")
-    dr = dsp.add_parser("remove"); dr.add_argument("task_id"); dr.add_argument("--depends-on", required=True); dr.add_argument("--type")
+    da = dsp.add_parser("add"); da.add_argument("task_id"); da.add_argument("--depends-on", required=True); da.add_argument("--type", choices=("waiting_on", "blocking"))
+    dr = dsp.add_parser("remove"); dr.add_argument("task_id"); dr.add_argument("--depends-on", required=True); dr.add_argument("--type", choices=("waiting_on", "blocking"))
 
     # time
     tmp = sub.add_parser("time")
@@ -694,7 +611,35 @@ def main():
         "time": cmd_time,
         "custom-fields": cmd_custom_fields,
     }
-    dispatch[args.command](args)
+    global _TOKEN, _TEAM_ID, _WRITE_ALLOWED
+    _TOKEN = load_token(args.token_file)
+    if any(_TOKEN in value for value in sys.argv[1:]):
+        raise CLIError("credential values are not allowed in argv")
+    _TEAM_ID = None
+    _WRITE_ALLOWED = (args.command, getattr(args, "sub", None)) in WRITE_COMMANDS
+    validate_args(args)
+    emit(dispatch[args.command](args))
+
+
+def main():
+    global _TOKEN, _WRITE_ALLOWED
+    _TOKEN, _WRITE_ALLOWED = None, False
+    try:
+        _main()
+        return 0
+    except CLIError as exc:
+        emit({"error": exc.details}, sys.stderr)
+        return exc.code
+    except (ValueError, OverflowError):
+        emit({"error": {"message": "invalid date or numeric value"}}, sys.stderr)
+        return 2
+    except Exception:
+        # Do not expose traceback, exception text, response data or credentials.
+        emit({"error": {"message": "unexpected API response or internal failure"}}, sys.stderr)
+        return 6
+    finally:
+        _TOKEN, _WRITE_ALLOWED = None, False
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
